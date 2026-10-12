@@ -2,7 +2,8 @@
 # 安装: pip install -r requirements-linux.txt
 
 Django==5.0.4
-psutil==5.9.1
+# psutil 5.9.4 起才有 cp312 wheel；5.9.1 早于 Python 3.12 发布，在 3.12 上只能源码编译
+psutil==5.9.4
 requests==2.28.2
 pyinstaller==6.11.1
 xlrd==1.2.0

@@ -5,7 +5,9 @@
 """
 NvrView 模块 — 24/7 录像 + FFmpeg 截图
 """
+import logging
 import os
+import re
 import time
 import subprocess
 from datetime import timedelta
@@ -14,6 +16,12 @@ from app.utils.Utils import buildPageLabels
 from app.utils.LanguageUtils import LANG_VIEWS_T
 from django.http import HttpResponse
 from django.shortcuts import render
+
+logger = logging.getLogger("views.nvr")
+
+# 流名白名单：Unicode 字母/数字/下划线 + . - 空格，长度 1~64。
+# \w 带 re.UNICODE 时包含中文，故中文编号/流名照常放行；引号、& | ; $ ` 与 / \ 一律拒绝。
+_STREAM_NAME_RE = re.compile(r"^[\w.\- ]{1,64}$", re.UNICODE)
 
 
 def record_index(request):
@@ -307,9 +315,30 @@ def _capture_snap_file(rtsp_url, snap_path, ffmpeg_cmd):
             os.remove(snap_path)
         except Exception:
             pass
-    command = '"{ffmpeg}" -loglevel quiet -rtsp_transport tcp -stimeout 5000000 -i "{rtsp_url}" -frames:v 1 -y "{snap_path}"'.format(
-        ffmpeg=ffmpeg_cmd, rtsp_url=rtsp_url, snap_path=snap_path)
-    subprocess.run(command, shell=True, timeout=12, capture_output=True)
+    # 安全（勿改回字符串拼接 + shell=True）：
+    # rtsp_url 由调用方的 app/name 直接拼接而成且未做转义（见 ZLMediaKitApi.get_rtspUrl），
+    # 走 shell 时可用 " 闭合引号、再用 & 追加命令 → 任意命令执行。
+    # 参数列表形式下 shell 不参与解释，特殊字符一律当作普通参数。
+    command = [
+        ffmpeg_cmd,
+        "-loglevel", "error",          # 原为 quiet，抓帧失败时无任何线索可查
+        "-rtsp_transport", "tcp",
+        "-stimeout", "5000000",
+        "-i", rtsp_url,
+        "-frames:v", "1",
+        "-y", snap_path,
+    ]
+    try:
+        proc = subprocess.run(command, shell=False, timeout=12, capture_output=True)
+    except subprocess.TimeoutExpired:
+        raise                          # 交由 api_openSnap 统一返回 snap timeout
+    except Exception as e:
+        logger.warning("snapshot ffmpeg 启动失败: %s", e)
+        return None
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        logger.warning("snapshot ffmpeg 退出码 %s: %s",
+                       proc.returncode, err[:500] or "(无 stderr 输出)")
     if os.path.exists(snap_path):
         with open(snap_path, "rb") as f:
             data = f.read()
@@ -326,6 +355,13 @@ def api_openSnap(request):
         force = str(params.get("force", "0")).strip() == "1"
         if not app or not name:
             return HttpResponse(b"missing app or name", status=400, content_type="text/plain")
+        # 白名单校验：app/name 会同时进入 rtsp 路径与本地文件名。
+        # 放行「Unicode 字母/数字/下划线 + . - 空格」，即完整覆盖正常流名（含中文）；
+        # 拒绝引号、& | ; $ ` 、路径分隔符等 —— 这些既能用于命令拼接，也会破坏本地文件名。
+        # 注意：不要收紧成 ^[A-Za-z0-9_.-]+$ —— 添加视频页的「编号」可手填且无前端校验
+        # （stream.name = code 原样入库），收紧会让中文编号的流快照全部 400。
+        if not _STREAM_NAME_RE.match(app) or not _STREAM_NAME_RE.match(name):
+            return HttpResponse(b"invalid app or name", status=400, content_type="text/plain")
         snap_dir = os.path.join(g_config.storageDir, "snapshots")
         safe_app = "".join(c for c in app if c.isalnum() or c in ("_", "-", "."))
         safe_name = "".join(c for c in name if c.isalnum() or c in ("_", "-", "."))

@@ -155,36 +155,174 @@ def _ffmpeg_path():
         return "ffmpeg"
 
 
-def _encode_video_h264(raw_path, final_path):
-    """将 OpenCV 输出的视频转码为浏览器可播的 H.264 MP4。"""
-    if not os.path.isfile(raw_path) or os.path.getsize(raw_path) <= 0:
+_NVENC_CACHE = {"checked": False, "ok": False, "ts": 0.0}
+
+# NVENC 可用性探测：实编一次空源（约 0.3~0.6s），结果进程内缓存。
+# 光看「ffmpeg 是否编入了 h264_nvenc」不够 —— 驱动过老、显卡不支持、
+# 并发会话已满都会在运行时报错，必须实编一次才算数。
+# 尺寸用 320x240 而非更小的 64x64：NVENC 有分辨率下限（本机实测 48x48 可过、32x32 报错），
+# 不同驱动/构建的下限不一致，贴着下限探测会在正常机器上误报「NVENC 不可用」。
+_NVENC_PROBE_ARGS = [
+    "-hide_banner", "-loglevel", "error",
+    "-f", "lavfi", "-i", "nullsrc=s=320x240:d=0.2",
+    "-c:v", "h264_nvenc", "-f", "null", "-",
+]
+_CPU_ENCODE_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+
+# 探测失败后的冷却时间（秒）：失败结果只短期缓存，到点重探。
+# 不能把失败永久缓存 —— 分析跑满时 NVENC 会话会占满 8 路，此刻探测必然失败
+# （OpenEncodeSessionEx failed: incompatible client key），若永久缓存则整个进程
+# 此后都走 CPU，只能重启服务才能恢复。
+_NVENC_FAIL_RETRY_SECONDS = 120.0
+
+
+def _encoder_mode():
+    """读取配置的编码器模式：auto（默认）/ nvenc / cpu。非法值按 auto 处理。"""
+    try:
+        from app.utils.GlobalUtils import g_config
+        v = str(getattr(g_config, "algorithmTestEncoder", "auto") or "auto").strip().lower()
+    except Exception:
+        v = "auto"
+    return v if v in ("auto", "nvenc", "cpu") else "auto"
+
+
+def _nvenc_available():
+    """探测 h264_nvenc 能否真正工作。
+
+    成功结果永久缓存（进程内）；失败结果只缓存 _NVENC_FAIL_RETRY_SECONDS 秒，
+    到点重探 —— 避免「探测时正好会话占满」把整个进程永久钉在 CPU 上。
+    """
+    now = time.time()
+    if _NVENC_CACHE["checked"]:
+        if _NVENC_CACHE["ok"]:
+            return True
+        if (now - _NVENC_CACHE["ts"]) < _NVENC_FAIL_RETRY_SECONDS:
+            return False
+        logger.info("NVENC 上次探测失败已超过 %.0fs，重新探测", _NVENC_FAIL_RETRY_SECONDS)
+
+    ok = False
+    try:
+        r = subprocess.run([_ffmpeg_path()] + _NVENC_PROBE_ARGS,
+                           capture_output=True, timeout=30)
+        ok = (r.returncode == 0)
+        if not ok:
+            err = (r.stderr or b"").decode("utf-8", errors="ignore")[:300]
+            logger.warning("NVENC 不可用，本次转码走 CPU。原因：%s", err or "(无 stderr)")
+    except Exception as e:
+        logger.warning("NVENC 探测异常，本次转码走 CPU：%s", e)
+    _NVENC_CACHE["checked"] = True
+    _NVENC_CACHE["ok"] = ok
+    _NVENC_CACHE["ts"] = now
+    if ok:
+        logger.info("NVENC 探测通过，h264_nvenc 可用")
+    return ok
+
+
+# —— 成本模型（2026-10-12 在本机实测标定：GTX 960M / 驱动 580.88 / ffmpeg 4.3.1）——
+# 一次性转码每次都要新起 ffmpeg 进程，CUDA context 也随之重建，这笔固定开销必须计入，
+# 否则会出现「稳态吞吐更快、单次却更慢」的误判（同源坑：单帧抓帧别加 -hwaccel cuda）。
+#   硬编 ≈ 0.35s 固定开销 + 帧数 × 6ms   （实测稳态 480p/720p/1080p = 4.5 / 5.1 / 6.4 ms/帧）
+#   软编 ≈ 帧数 × 百万像素 × 12ms        （实测 480p/720p/1080p = 16.2 / 11.3 / 10.0 ms/Mpx·帧）
+# 实测 5s@25fps 单次结果：640x480 硬编慢 1.2 倍、1280x720 快 25%、1920x1080 快 55%。
+# 即：≤480p 短片段软编更划算，≥720p 硬编才划算，片段越长越大优势越明显。
+# 下方常数是标定值，换机器/换 ffmpeg 只需重测这三个数即可。
+_NVENC_INIT_SECONDS = 0.35
+_NVENC_PER_FRAME_SECONDS = 0.006
+_CPU_SECONDS_PER_MEGAPIXEL_FRAME = 0.012
+_NVENC_GAIN_MARGIN = 0.85   # 要求硬编预估至少快 15% 才切换，避免在临界点来回抖
+
+
+def _nvenc_worthwhile(w, h, frames):
+    """按成本模型预估硬编是否真的更快。
+
+    尺寸或帧数未知时保守返回 False（走 CPU，即旧行为，不会更差）。
+    """
+    if w <= 0 or h <= 0 or frames <= 0:
         return False
+    gpu = _NVENC_INIT_SECONDS + frames * _NVENC_PER_FRAME_SECONDS
+    cpu = frames * (w * h / 1e6) * _CPU_SECONDS_PER_MEGAPIXEL_FRAME
+    return gpu < cpu * _NVENC_GAIN_MARGIN
+
+
+def _encoder_args(w=0, h=0, frames=0):
+    """按配置解析出本次要用的编码参数，返回 (参数列表, 编码器名)。
+
+    auto：仅当探测可用 **且** 成本模型预估更快时才用硬编，否则走 CPU。
+    nvenc：强制硬编（不可用则告警并回退 CPU），跳过成本模型，便于人工指定/压测。
+    cpu：强制软编。
+    """
+    mode = _encoder_mode()
+    if mode == "cpu":
+        return _CPU_ENCODE_ARGS, "libx264"
+    if not _nvenc_available():
+        if mode == "nvenc":
+            logger.warning("配置 algorithmTestEncoder=nvenc，但 NVENC 不可用；本次回退 libx264")
+        return _CPU_ENCODE_ARGS, "libx264"
+    if mode == "auto" and not _nvenc_worthwhile(w, h, frames):
+        # auto 判定为不划算：这不是降级，是正常选择，用 info 级别记录便于核对
+        logger.info("NVENC 可用，但本次 %sx%s / %s 帧预估硬编不划算，改用 libx264",
+                    w or "?", h or "?", frames or "?")
+        return _CPU_ENCODE_ARGS, "libx264"
+    # -cq 是 NVENC 的恒定质量模式，语义对应 libx264 的 -crf（NVENC 不认 crf 参数）
+    return ["-c:v", "h264_nvenc", "-preset", "fast", "-cq", "23"], "h264_nvenc"
+
+
+def _try_encode(raw_path, final_path, enc_args, enc_name):
+    """单次转码尝试。成功则落盘 final_path 并清理 raw，返回 True。"""
     tmp = final_path + ".part.mp4"
-    cmd = [
-        _ffmpeg_path(), "-y", "-loglevel", "error",
-        "-i", raw_path,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        tmp,
-    ]
+    cmd = ([_ffmpeg_path(), "-y", "-loglevel", "error", "-i", raw_path]
+           + enc_args
+           + ["-pix_fmt", "yuv420p", "-movflags", "+faststart", tmp])
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=600)
         if r.returncode == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
             if os.path.isfile(final_path):
                 os.remove(final_path)
             os.replace(tmp, final_path)
-            if os.path.abspath(raw_path) != os.path.abspath(final_path) and os.path.isfile(raw_path):
+            if (os.path.abspath(raw_path) != os.path.abspath(final_path)
+                    and os.path.isfile(raw_path)):
                 os.remove(raw_path)
+            logger.info("算法测试转码完成（%s）", enc_name)
             return True
         if r.stderr:
-            logger.warning("ffmpeg encode stderr: %s", r.stderr.decode("utf-8", errors="ignore")[:500])
+            logger.warning("ffmpeg(%s) encode stderr: %s", enc_name,
+                           r.stderr.decode("utf-8", errors="ignore")[:500])
     except Exception as e:
-        logger.warning("ffmpeg encode failed: %s", e)
+        logger.warning("ffmpeg(%s) encode failed: %s", enc_name, e)
     if os.path.isfile(tmp):
         try:
             os.remove(tmp)
         except Exception:
             pass
+    return False
+
+
+def _encode_video_h264(raw_path, final_path, w=0, h=0, frames=0):
+    """将 OpenCV 输出的视频转码为浏览器可播的 H.264 MP4。
+
+    编码器按 config 的 algorithmTestEncoder 选择（默认 auto）。
+    auto 会先按成本模型判断硬编是否真的更快：每次转码都新起 ffmpeg 进程、
+    CUDA context 每次重建，小尺寸短片段用硬编反而更慢，此时自动走 CPU。
+    硬编失败时先重试 CPU 软编，仍失败才退回「复制原文件」。全过程有日志，不静默降级。
+
+    参数 w/h/frames 用于成本模型预估（调用方都能拿到）；不传则保守走 CPU。
+    实测参考：本机 NVENC 会话上限 8，1080p30 实时 6 路 / 720p25 实时 8 路。
+    """
+    if not os.path.isfile(raw_path) or os.path.getsize(raw_path) <= 0:
+        return False
+
+    enc_args, enc_name = _encoder_args(w=w, h=h, frames=frames)
+    if _try_encode(raw_path, final_path, enc_args, enc_name):
+        return True
+
+    # 首选编码器失败 → 若不是 CPU，重试 CPU，避免直接退化成不可播的裸文件
+    if enc_name != "libx264":
+        logger.warning("首选编码器 %s 失败，改用 libx264 重试", enc_name)
+        if _try_encode(raw_path, final_path, _CPU_ENCODE_ARGS, "libx264"):
+            return True
+
+    # 两种编码器都失败 → 保留原有兜底：复制原文件，保证有产物且失败可见
+    logger.warning("H.264 转码失败（已尝试 %s 与 libx264），回退为复制原文件", enc_name)
     if os.path.isfile(raw_path) and not os.path.isfile(final_path):
         try:
             shutil.copy2(raw_path, final_path)
@@ -571,7 +709,7 @@ def _run_reid_test(task_id, algo, detector_algo, input_path, media_type, out_dir
     if not os.path.isfile(raw_path) or os.path.getsize(raw_path) <= 0:
         raise RuntimeError("raw video missing")
     _task_update(task_id, progress=88, message="encoding video (H.264)")
-    if not _encode_video_h264(raw_path, final_path):
+    if not _encode_video_h264(raw_path, final_path, w=w, h=h, frames=processed):
         raise RuntimeError("video encode failed")
     report = {
         "media_type": "video",
@@ -708,7 +846,7 @@ def _run_test(task_id, algo, input_path, media_type, out_dir, detector_algo=None
             raise RuntimeError("raw video missing")
 
         _task_update(task_id, progress=88, message="encoding video (H.264)")
-        if not _encode_video_h264(raw_path, final_path):
+        if not _encode_video_h264(raw_path, final_path, w=w, h=h, frames=processed):
             raise RuntimeError("video encode failed")
 
         _task_update(task_id, progress=95, message="saving result")

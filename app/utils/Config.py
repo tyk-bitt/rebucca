@@ -83,6 +83,12 @@ class Config:
 
         # —— 路径与工具 ——
         self.ffmpeg = str(config_data.get("ffmpeg", "ffmpeg") or "ffmpeg").strip()
+        # 算法测试转码编码器：auto=NVENC 可用且预估更快时才用硬编、否则走 CPU（默认）；
+        # nvenc=强制硬编（不可用则告警并回退 CPU）；cpu=强制 libx264（旧行为，回滚用）
+        # 注：auto 带成本门槛——每次转码都新起 ffmpeg 进程，CUDA context 重建有固定开销，
+        # 小尺寸短片段用硬编反而更慢，故仅在 ≥720p / 长片段时启用。详见 algorithm_test_service.py
+        self.algorithmTestEncoder = str(
+            config_data.get("algorithmTestEncoder", "auto") or "auto").strip().lower()
         self.fontPath = _resolve_path(config_data.get("fontPath", ""), base)
         self.uploadDir = _resolve_path(config_data.get("uploadDir", "static/upload"), base)
         self.storageDir = _resolve_path(config_data.get("storageDir", "static/storage"), base)

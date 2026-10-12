@@ -24,6 +24,7 @@
     "analysisProcessMode": 1,
     "analysisSharedInference": true,
     "analysisInferenceWorkers": 2,
+    "algorithmTestEncoder": "auto",
     "recordingEnabled": false,
     "recordingSegmentSeconds": 600,
     "recordingRetainDays": 7,

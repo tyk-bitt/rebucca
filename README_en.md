@@ -111,6 +111,18 @@ Log directory: `log/`. For the version number, see `framework/settings.py`.
 
 ## Changelog
 
+### v1.006
+- 2026/10/12
+- **Fixed a pre-authentication arbitrary command execution flaw (security, important)**
+  - `/nvr/openSnap` sits on the no-login whitelist, and its `app` / `name` parameters were concatenated straight into the RTSP URL and handed to the shell — closing the quote and appending an `&` command allowed arbitrary command execution **without logging in**.
+  - FFmpeg is now invoked via an argument list (no shell), plus a stream-name whitelist: letters, digits, underscore, `.`, `-`, space and CJK characters are allowed; quotes, `&`, `|`, `;`, `$`, backticks and path separators are rejected. Keeping CJK support matters — the "code" field on the Add Video page is free-form with no front-end validation, so restricting it to ASCII would break snapshots for every stream with a Chinese name.
+- **NVENC hardware encoding for algorithm-test transcoding (new config key `algorithmTestEncoder`)**
+  - New `config.json` key `algorithmTestEncoder`: `auto` (default) / `nvenc` (force hardware) / `cpu` (force software, identical to previous behaviour).
+  - `auto` is gated by a cost model: every transcode spawns a fresh FFmpeg process, so the CUDA context is rebuilt each time — a fixed cost of roughly 0.35s. Hardware encoding is therefore used only when it is estimated to be faster. Measured single-run timings for a 5s 25fps clip: 640×480 is 1.2× **slower** on hardware (falls back to CPU), 1280×720 is 25% faster, 1920×1080 is 55% faster. In short: software wins for short ≤480p clips; from ≥720p upwards, the longer and larger the clip, the bigger the hardware win.
+  - The NVENC availability probe now encodes a real 320×240 source; the previous 64×64 sat right on the encoder's minimum resolution (48×48 passes, 32×32 errors on the test machine) and could falsely report "NVENC unavailable" on healthy machines.
+  - Probe failures are no longer cached forever: they are retried after a 120s cooldown. Analysis tasks can occupy every encoder session, in which case the probe necessarily fails — caching that permanently would pin the process to CPU until a restart.
+  - If hardware encoding fails it automatically retries with software; only if both fail does it fall back to copying the raw file. Snapshot capture and transcoding now log throughout instead of failing silently.
+
 ### v1.005
 - 2026/09/24
 - **New "Absence Detection" post-processing rule (7th business rule)**

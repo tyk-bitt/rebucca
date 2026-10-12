@@ -2,7 +2,7 @@
 官网：https://www.yuturuishi.com
 微信：yuturuishi
 gitee开源地址：https://gitee.com/yuturuishi/rebucca
-github开源地址：https://github.com/beixiaocai/rebucca
+github开源地址：https://github.com/yuturuishi/rebucca
 -->
 
 {% extends "app/base.html" %}
@@ -1127,7 +1127,7 @@ function renderAlgoList(selectedIds){
     return;
   }
   var sel = selectedIds || [];
-  var typeMap = {yolo5:'YOLOv5',yolo8:'YOLOv8',yolo11:'YOLOv11',yolo26:'YOLO26'};
+  var typeMap = {yolo5:'YOLOv5',yolo8:'YOLOv8',yolo11:'YOLOv11',yolo26:'YOLO26',dfine:'D-FINE'};
   var engMap = {yolo_pytorch:'Yolo-PyTorch',onnxruntime:'OnnxRuntime',openvino:'OpenVINO'};
   var html = '';
   g_algorithms.forEach(function(a){

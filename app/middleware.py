@@ -1,7 +1,7 @@
 # 官网：https://www.yuturuishi.com
 # 微信：yuturuishi
 # gitee开源地址：https://gitee.com/yuturuishi/rebucca
-# github开源地址：https://github.com/beixiaocai/rebucca
+# github开源地址：https://github.com/yuturuishi/rebucca
 from django.http import HttpResponseRedirect
 
 try:
@@ -17,6 +17,7 @@ AUTH_WHITELIST_PREFIXES = (
     '/nvr/openSnap',
     '/user/openCaptcha',
     '/static/',
+    '/favicon.ico',  # 浏览器标签页图标（每个页面都会自动请求）
 )
 
 # 需 Safe 请求头鉴权的 open API（供 ZLM/内部服务调用，不暴露给浏览器）
